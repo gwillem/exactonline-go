@@ -17,9 +17,19 @@ import (
 )
 
 const (
-	baseURL    = "https://start.exactonline.nl"
-	divisionID = "3336390"
+	baseURL   = "https://start.exactonline.nl"
+	userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
 )
+
+// uaTransport wraps an http.RoundTripper to set User-Agent on all requests.
+type uaTransport struct {
+	base http.RoundTripper
+}
+
+func (t *uaTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req.Header.Set("User-Agent", userAgent)
+	return t.base.RoundTrip(req)
+}
 
 // Client is an authenticated Exact Online HTTP client.
 type Client struct {
@@ -43,26 +53,35 @@ func NewClient(username, password, totpSecret string) (*Client, error) {
 	jar, _ := cookiejar.New(nil)
 	c := &Client{
 		http: &http.Client{
-			Jar:     jar,
-			Timeout: 30 * time.Second,
+			Transport: &uaTransport{base: http.DefaultTransport},
+			Jar:       jar,
+			Timeout:   30 * time.Second,
 		},
-		divisionID: divisionID,
 	}
 	if err := c.login(username, password, totpSecret); err != nil {
 		return nil, fmt.Errorf("login failed: %w", err)
 	}
+	if err := c.detectDivision(); err != nil {
+		return nil, fmt.Errorf("detect division: %w", err)
+	}
 	return c, nil
 }
 
-// NewClientWithCookies creates a client using pre-existing cookies, skipping login.
-func NewClientWithCookies(cookies []*http.Cookie) *Client {
+// DivisionID returns the active division ID.
+func (c *Client) DivisionID() string {
+	return c.divisionID
+}
+
+// NewClientWithCookies creates a client using pre-existing cookies and division ID, skipping login.
+func NewClientWithCookies(cookies []*http.Cookie, divisionID string) *Client {
 	jar, _ := cookiejar.New(nil)
 	u, _ := url.Parse(baseURL)
 	jar.SetCookies(u, cookies)
 	return &Client{
 		http: &http.Client{
-			Jar:     jar,
-			Timeout: 30 * time.Second,
+			Transport: &uaTransport{base: http.DefaultTransport},
+			Jar:       jar,
+			Timeout:   30 * time.Second,
 		},
 		divisionID: divisionID,
 	}
@@ -86,6 +105,24 @@ func (c *Client) SessionValid() bool {
 func (c *Client) Cookies() []*http.Cookie {
 	u, _ := url.Parse(baseURL)
 	return c.http.Jar.Cookies(u)
+}
+
+// detectDivision discovers the active division ID by following the homepage redirect.
+func (c *Client) detectDivision() error {
+	resp, err := c.http.Get(baseURL + "/")
+	if err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+
+	q := resp.Request.URL.Query()
+	div := q.Get("_Division_")
+	if div == "" {
+		return fmt.Errorf("no _Division_ in redirect URL: %s", resp.Request.URL)
+	}
+	log.Printf("Detected division ID: %s", div)
+	c.divisionID = div
+	return nil
 }
 
 func (c *Client) login(username, password, totpSecret string) error {
@@ -153,7 +190,7 @@ func (c *Client) login(username, password, totpSecret string) error {
 
 		if containsField(fields, "userAgent") {
 			log.Println("Submitting user agent...")
-			formData.Set("userAgent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)")
+			formData.Set("userAgent", userAgent)
 		} else if containsField(fields, "totpVerificationCode") {
 			log.Println("Generating TOTP code...")
 			code, err := totp.GenerateCode(totpSecret, time.Now())

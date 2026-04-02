@@ -180,7 +180,6 @@ func (c *Client) uploadFile(filePath, uploadURL string) error {
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Origin", baseURL)
 	req.Header.Set("Referer", baseURL+"/docs/ClientPortalFinancialUpload.aspx?Type=20&IsPurchaseOverview=true&_Division_="+c.divisionID)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
 
 	// Don't follow redirects — OcrService may 302 on success
 	c.http.CheckRedirect = func(req *http.Request, via []*http.Request) error {

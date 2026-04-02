@@ -22,8 +22,19 @@ var opts struct {
 
 func main() {
 	parser := flags.NewParser(&opts, flags.Default)
-	parser.AddCommand("login", "Authenticate and store credentials", "", &LoginCmd{})
-	parser.AddCommand("inkoop", "Purchase invoice operations", "", &InkoopCmd{})
+	if _, err := parser.AddCommand("login", "Authenticate and store credentials", "", &LoginCmd{}); err != nil {
+		log.Fatal(err)
+	}
+	if _, err := parser.AddCommand("inkoop", "Purchase invoice operations", "", &InkoopCmd{}); err != nil {
+		log.Fatal(err)
+	}
+
+	parser.CommandHandler = func(cmd flags.Commander, args []string) error {
+		if opts.Verbose {
+			log.SetOutput(os.Stderr)
+		}
+		return cmd.Execute(args)
+	}
 
 	if _, err := parser.Parse(); err != nil {
 		if flagsErr, ok := err.(*flags.Error); ok && flagsErr.Type == flags.ErrHelp {
@@ -34,26 +45,30 @@ func main() {
 }
 
 func newClient() (*exactonline.Client, error) {
-	username, password, totpSecret, err := loadCredentials()
+	creds, err := loadCredentials()
 	if err != nil {
 		return nil, fmt.Errorf("no login credentials found, run: exact login")
 	}
 
 	// Try cached session first
-	if cookies := loadCookies(); len(cookies) > 0 {
-		c := exactonline.NewClientWithCookies(cookies)
-		if c.SessionValid() {
-			log.Println("Reusing cached session")
-			return c, nil
+	if creds.DivisionID != "" {
+		if cookies := loadCookies(); len(cookies) > 0 {
+			c := exactonline.NewClientWithCookies(cookies, creds.DivisionID)
+			if c.SessionValid() {
+				log.Println("Reusing cached session")
+				return c, nil
+			}
+			log.Println("Cached session expired, re-authenticating...")
 		}
-		log.Println("Cached session expired, re-authenticating...")
 	}
 
-	c, err := exactonline.NewClient(username, password, totpSecret)
+	c, err := exactonline.NewClient(creds.Username, creds.Password, creds.TOTPSecret)
 	if err != nil {
 		return nil, err
 	}
 	saveCookies(c.Cookies())
+	creds.DivisionID = c.DivisionID()
+	_ = saveCredentials(creds)
 	return c, nil
 }
 
@@ -71,14 +86,10 @@ type savedCredentials struct {
 	Username   string `json:"username"`
 	Password   string `json:"password"`
 	TOTPSecret string `json:"totp_secret"`
+	DivisionID string `json:"division_id,omitempty"`
 }
 
-func saveCredentials(username, password, totpSecret string) error {
-	creds := savedCredentials{
-		Username:   username,
-		Password:   password,
-		TOTPSecret: totpSecret,
-	}
+func saveCredentials(creds savedCredentials) error {
 	data, err := json.Marshal(creds)
 	if err != nil {
 		return err
@@ -88,19 +99,19 @@ func saveCredentials(username, password, totpSecret string) error {
 	return os.WriteFile(path, data, 0o600)
 }
 
-func loadCredentials() (username, password, totpSecret string, err error) {
+func loadCredentials() (savedCredentials, error) {
 	data, err := os.ReadFile(cachePath("credentials.json"))
 	if err != nil {
-		return "", "", "", err
+		return savedCredentials{}, err
 	}
 	var creds savedCredentials
 	if err := json.Unmarshal(data, &creds); err != nil {
-		return "", "", "", err
+		return savedCredentials{}, err
 	}
 	if creds.Username == "" || creds.Password == "" || creds.TOTPSecret == "" {
-		return "", "", "", fmt.Errorf("incomplete credentials")
+		return savedCredentials{}, fmt.Errorf("incomplete credentials")
 	}
-	return creds.Username, creds.Password, creds.TOTPSecret, nil
+	return creds, nil
 }
 
 type savedCookie struct {
@@ -154,18 +165,10 @@ func init() {
 	log.SetOutput(io.Discard)
 }
 
-func setupLogging() {
-	if opts.Verbose {
-		log.SetOutput(os.Stderr)
-	}
-}
-
 // LoginCmd prompts for credentials, tests login, and stores them.
 type LoginCmd struct{}
 
 func (cmd *LoginCmd) Execute(args []string) error {
-	setupLogging()
-
 	reader := bufio.NewReader(os.Stdin)
 
 	fmt.Print("Username (email): ")
@@ -190,12 +193,18 @@ func (cmd *LoginCmd) Execute(args []string) error {
 		return err
 	}
 
-	if err := saveCredentials(username, password, totpSecret); err != nil {
+	creds := savedCredentials{
+		Username:   username,
+		Password:   password,
+		TOTPSecret: totpSecret,
+		DivisionID: c.DivisionID(),
+	}
+	if err := saveCredentials(creds); err != nil {
 		return fmt.Errorf("saving credentials: %w", err)
 	}
 	saveCookies(c.Cookies())
 
-	fmt.Println("Login successful! Credentials saved.")
+	fmt.Printf("Login successful! Division %s, credentials saved.\n", c.DivisionID())
 	return nil
 }
 
@@ -208,7 +217,6 @@ type InkoopCmd struct {
 type InkoopListCmd struct{}
 
 func (cmd *InkoopListCmd) Execute(args []string) error {
-	setupLogging()
 	client, err := newClient()
 	if err != nil {
 		return err
@@ -241,8 +249,6 @@ var validExts = map[string]bool{
 }
 
 func (cmd *InkoopUploadCmd) Execute(args []string) error {
-	setupLogging()
-
 	// Validate files
 	for _, f := range cmd.Args.Files {
 		ext := strings.ToLower(filepath.Ext(f))
