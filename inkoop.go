@@ -8,7 +8,6 @@ import (
 	"log"
 	"mime/multipart"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -227,36 +226,4 @@ func (c *Client) uploadFile(filePath, uploadURL string) error {
 
 	log.Printf("Uploaded %s (ID: %s)", filepath.Base(filePath), result.MailMessageID)
 	return nil
-}
-
-// Debug returns basic session info for testing the login flow.
-func (c *Client) Debug() (map[string]any, error) {
-	info := map[string]any{
-		"division_id": c.divisionID,
-	}
-
-	resp, err := c.http.Get(baseURL + "/Dashboard/MyFirmDashboard?_Division_=" + c.divisionID)
-	if err != nil {
-		return info, fmt.Errorf("GET dashboard: %w", err)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-
-	info["dashboard_status"] = resp.StatusCode
-	info["dashboard_url"] = resp.Request.URL.String()
-
-	titleRe := regexp.MustCompile(`<title>([^<]+)</title>`)
-	if m := titleRe.FindStringSubmatch(string(body)); m != nil {
-		info["page_title"] = strings.TrimSpace(m[1])
-	}
-
-	u, _ := url.Parse(baseURL)
-	cookies := c.http.Jar.Cookies(u)
-	cookieNames := make([]string, len(cookies))
-	for i, ck := range cookies {
-		cookieNames[i] = ck.Name
-	}
-	info["cookies"] = cookieNames
-
-	return info, nil
 }
