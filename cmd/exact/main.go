@@ -270,19 +270,34 @@ func (cmd *InkoopUploadCmd) Execute(args []string) error {
 	}
 
 	results, err := client.UploadInkoop(cmd.Args.Files)
-	for _, r := range results {
-		if r.AlreadyUploaded {
-			dir := filepath.Join(filepath.Dir(r.File), "uploaded")
-			_ = os.MkdirAll(dir, 0o755)
-			dest := filepath.Join(dir, filepath.Base(r.File))
-			if mvErr := os.Rename(r.File, dest); mvErr != nil {
-				fmt.Fprintf(os.Stderr, "warning: could not move %s to %s: %v\n", r.File, dest, mvErr)
-			} else {
-				fmt.Printf("Already uploaded, moved to %s\n", dest)
-			}
-		}
-	}
+	moveUploadedFiles(results)
 	return err
+}
+
+func moveUploadedFiles(results []exactonline.UploadResult) int {
+	moved := 0
+	for _, r := range results {
+		if r.Err != nil {
+			continue
+		}
+		dir := filepath.Join(filepath.Dir(r.File), "uploaded")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not create %s: %v\n", dir, err)
+			continue
+		}
+		dest := filepath.Join(dir, filepath.Base(r.File))
+		if err := os.Rename(r.File, dest); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not move %s to %s: %v\n", r.File, dest, err)
+			continue
+		}
+		if r.AlreadyUploaded {
+			fmt.Printf("Already uploaded, moved to %s\n", dest)
+		} else {
+			fmt.Printf("Uploaded, moved to %s\n", dest)
+		}
+		moved++
+	}
+	return moved
 }
 
 // ReportCmd is the parent command for report subcommands.
