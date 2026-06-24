@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	exactonline "github.com/gwillem/exactonline-go"
 	flags "github.com/jessevdk/go-flags"
@@ -26,6 +27,9 @@ func main() {
 		log.Fatal(err)
 	}
 	if _, err := parser.AddCommand("inkoop", "Purchase invoice operations", "", &InkoopCmd{}); err != nil {
+		log.Fatal(err)
+	}
+	if _, err := parser.AddCommand("report", "Financial report operations", "", &ReportCmd{}); err != nil {
 		log.Fatal(err)
 	}
 
@@ -265,5 +269,66 @@ func (cmd *InkoopUploadCmd) Execute(args []string) error {
 		return err
 	}
 
-	return client.UploadInkoop(cmd.Args.Files)
+	results, err := client.UploadInkoop(cmd.Args.Files)
+	for _, r := range results {
+		if r.AlreadyUploaded {
+			dir := filepath.Join(filepath.Dir(r.File), "uploaded")
+			_ = os.MkdirAll(dir, 0o755)
+			dest := filepath.Join(dir, filepath.Base(r.File))
+			if mvErr := os.Rename(r.File, dest); mvErr != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not move %s to %s: %v\n", r.File, dest, mvErr)
+			} else {
+				fmt.Printf("Already uploaded, moved to %s\n", dest)
+			}
+		}
+	}
+	return err
+}
+
+// ReportCmd is the parent command for report subcommands.
+type ReportCmd struct {
+	Download ReportDownloadCmd `command:"download" description:"Download financial report as Excel"`
+}
+
+// ReportDownloadCmd downloads a financial report.
+type ReportDownloadCmd struct {
+	Type   string `long:"type" default:"profitloss" choice:"profitloss" choice:"balancesheet" description:"Report type"`
+	Year   int    `long:"year" description:"Fiscal year (default: current)"`
+	From   int    `long:"from" default:"1" description:"Start period (1-12)"`
+	To     int    `long:"to" default:"12" description:"End period (1-12)"`
+	Output string `short:"o" long:"output" description:"Output filename (default: auto from server)"`
+}
+
+func (cmd *ReportDownloadCmd) Execute(args []string) error {
+	if cmd.Year == 0 {
+		cmd.Year = time.Now().Year()
+	}
+	if cmd.From < 1 || cmd.From > 12 || cmd.To < 1 || cmd.To > 12 || cmd.From > cmd.To {
+		return fmt.Errorf("invalid period range: %d-%d (must be 1-12, from <= to)", cmd.From, cmd.To)
+	}
+
+	client, err := newClient()
+	if err != nil {
+		return err
+	}
+
+	rt := exactonline.ReportType(cmd.Type)
+	data, filename, err := client.DownloadReport(rt, cmd.Year, cmd.From, cmd.To)
+	if err != nil {
+		return err
+	}
+
+	outPath := cmd.Output
+	if outPath == "" {
+		outPath = filename
+	}
+	if outPath == "" {
+		outPath = fmt.Sprintf("report-%s-%d-p%d-%d.xlsx", cmd.Type, cmd.Year, cmd.From, cmd.To)
+	}
+
+	if err := os.WriteFile(outPath, data, 0o644); err != nil {
+		return fmt.Errorf("write file: %w", err)
+	}
+	fmt.Printf("Downloaded %s (%d bytes)\n", outPath, len(data))
+	return nil
 }

@@ -35,6 +35,7 @@ func (t *uaTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 type Client struct {
 	http       *http.Client
 	divisionID string
+	baseURL    string // defaults to baseURL const; overridden in tests
 }
 
 // b2cSettings holds the parsed SETTINGS object from Azure B2C login pages.
@@ -46,6 +47,14 @@ type b2cSettings struct {
 		Tenant string `json:"tenant"`
 		Policy string `json:"policy"`
 	} `json:"hosts"`
+}
+
+// url returns the client's base URL.
+func (c *Client) url() string {
+	if c.baseURL != "" {
+		return c.baseURL
+	}
+	return baseURL
 }
 
 // NewClient creates an authenticated Exact Online client.
@@ -75,9 +84,7 @@ func (c *Client) DivisionID() string {
 // NewClientWithCookies creates a client using pre-existing cookies and division ID, skipping login.
 func NewClientWithCookies(cookies []*http.Cookie, divisionID string) *Client {
 	jar, _ := cookiejar.New(nil)
-	u, _ := url.Parse(baseURL)
-	jar.SetCookies(u, cookies)
-	return &Client{
+	c := &Client{
 		http: &http.Client{
 			Transport: &uaTransport{base: http.DefaultTransport},
 			Jar:       jar,
@@ -85,6 +92,9 @@ func NewClientWithCookies(cookies []*http.Cookie, divisionID string) *Client {
 		},
 		divisionID: divisionID,
 	}
+	u, _ := url.Parse(c.url())
+	jar.SetCookies(u, cookies)
+	return c
 }
 
 // SessionValid checks if the current session is still authenticated.
@@ -92,7 +102,7 @@ func (c *Client) SessionValid() bool {
 	c.http.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
-	resp, err := c.http.Get(baseURL + "/Dashboard/MyFirmDashboard?_Division_=" + c.divisionID)
+	resp, err := c.http.Get(c.url() + "/Dashboard/MyFirmDashboard?_Division_=" + c.divisionID)
 	c.http.CheckRedirect = nil
 	if err != nil {
 		return false
@@ -103,22 +113,49 @@ func (c *Client) SessionValid() bool {
 
 // Cookies returns the current session cookies for persistence.
 func (c *Client) Cookies() []*http.Cookie {
-	u, _ := url.Parse(baseURL)
+	u, _ := url.Parse(c.url())
 	return c.http.Jar.Cookies(u)
 }
 
 // detectDivision discovers the active division ID by following the homepage redirect.
+// For multi-company accounts, the redirect lands on MyFirmPortal with an empty _Division_;
+// in that case we parse the page for division links and pick the first one.
 func (c *Client) detectDivision() error {
-	resp, err := c.http.Get(baseURL + "/")
+	resp, err := c.http.Get(c.url() + "/")
 	if err != nil {
 		return err
 	}
+	body, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 
 	q := resp.Request.URL.Query()
 	div := q.Get("_Division_")
-	if div == "" {
-		return fmt.Errorf("no _Division_ in redirect URL: %s", resp.Request.URL)
+	if div != "" {
+		log.Printf("Detected division ID: %s", div)
+		c.divisionID = div
+		return nil
+	}
+
+	// Multi-company account: parse portal page for division links
+	re := regexp.MustCompile(`[?&]_Division_=(\d+)`)
+	matches := re.FindAllStringSubmatch(string(body), -1)
+	if len(matches) == 0 {
+		return fmt.Errorf("no divisions found on portal page: %s", resp.Request.URL)
+	}
+
+	// Deduplicate
+	seen := map[string]bool{}
+	var divisions []string
+	for _, m := range matches {
+		if !seen[m[1]] {
+			seen[m[1]] = true
+			divisions = append(divisions, m[1])
+		}
+	}
+
+	div = divisions[0]
+	if len(divisions) > 1 {
+		log.Printf("Found %d divisions: %v, using first: %s", len(divisions), divisions, div)
 	}
 	log.Printf("Detected division ID: %s", div)
 	c.divisionID = div
@@ -128,7 +165,7 @@ func (c *Client) detectDivision() error {
 func (c *Client) login(username, password, totpSecret string) error {
 	// Step 1: GET the homepage → extract anti-forgery token
 	log.Println("Starting Exact Online login...")
-	resp, err := c.http.Get(baseURL + "/")
+	resp, err := c.http.Get(c.url() + "/")
 	if err != nil {
 		return fmt.Errorf("GET homepage: %w", err)
 	}
@@ -142,7 +179,7 @@ func (c *Client) login(username, password, totpSecret string) error {
 	log.Println("Got anti-forgery token")
 
 	// Step 2: POST email to homepage form → redirects through Login.aspx → B2C authorize
-	resp, err = c.http.PostForm(baseURL+"/", url.Values{
+	resp, err = c.http.PostForm(c.url()+"/", url.Values{
 		"LoginForm$UserName":         {username},
 		"__RequestVerificationToken": {token},
 	})
@@ -320,7 +357,7 @@ func (c *Client) submitFinalForm(html string) error {
 			break
 		}
 		if !strings.HasPrefix(loc, "http") {
-			loc = baseURL + loc
+			loc = c.url() + loc
 		}
 		c.http.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
