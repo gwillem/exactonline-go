@@ -197,13 +197,24 @@ func (c *Client) login(username, password, totpSecret string) error {
 
 	b2cBase := "https://login.exact.com" + settings.Hosts.Tenant
 
-	// Step 2: POST credentials (email + password)
+	// Step 2: POST the fields requested by the first B2C page.
 	log.Println("Submitting credentials...")
-	err = c.b2cPost(b2cBase, settings, url.Values{
-		"signInName":   {username},
-		"password":     {password},
-		"request_type": {"RESPONSE"},
-	})
+	fields := parseSAFields(string(body))
+	var formData url.Values
+	if len(fields) == 0 {
+		// Older pages did not expose SA_FIELDS; keep the previous combined-form behavior.
+		formData = url.Values{
+			"signInName":   {username},
+			"password":     {password},
+			"request_type": {"RESPONSE"},
+		}
+	} else {
+		formData, err = fillB2CFields(fields, username, password, totpSecret)
+		if err != nil {
+			return fmt.Errorf("fill B2C credentials form: %w", err)
+		}
+	}
+	err = c.b2cPost(b2cBase, settings, formData)
 	if err != nil {
 		return fmt.Errorf("submit credentials: %w", err)
 	}
@@ -221,24 +232,24 @@ func (c *Client) login(username, password, totpSecret string) error {
 			return c.submitFinalForm(string(body2))
 		}
 
-		// Determine what this step needs
+		// Determine what this step needs.
 		fields := parseSAFields(string(body2))
-		formData := url.Values{"request_type": {"RESPONSE"}}
+		if len(fields) == 0 {
+			return fmt.Errorf("B2C step %d has no recognized fields", step)
+		}
+		formData, err := fillB2CFields(fields, username, password, totpSecret)
+		if err != nil {
+			return fmt.Errorf("fill B2C step %d form: %w", step, err)
+		}
 
 		if containsField(fields, "userAgent") {
 			log.Println("Submitting user agent...")
-			formData.Set("userAgent", userAgent)
 		} else if containsField(fields, "totpVerificationCode") {
 			log.Println("Generating TOTP code...")
-			code, err := totp.GenerateCode(totpSecret, time.Now())
-			if err != nil {
-				return fmt.Errorf("generate TOTP: %w", err)
-			}
-			formData.Set("totpVerificationCode", code)
-			formData.Set("reset_totp", "false")
-			formData.Set("totp_skip_days", "true")
-		} else {
-			log.Printf("Unknown B2C step with fields: %v", fields)
+		} else if containsField(fields, "signInName") || containsField(fields, "email") || containsField(fields, "emailAddress") {
+			log.Println("Submitting email address...")
+		} else if containsField(fields, "password") {
+			log.Println("Submitting password...")
 		}
 
 		settings, err = parseB2CSettings(string(body2))
@@ -408,6 +419,41 @@ func parseSAFields(html string) []string {
 		ids = append(ids, f.ID)
 	}
 	return ids
+}
+
+func fillB2CFields(fields []string, username, password, totpSecret string) (url.Values, error) {
+	data := url.Values{"request_type": {"RESPONSE"}}
+	var unknown []string
+
+	for _, field := range fields {
+		switch field {
+		case "signInName", "email", "emailAddress":
+			data.Set(field, username)
+		case "password":
+			data.Set(field, password)
+		case "userAgent":
+			data.Set(field, userAgent)
+		case "totpVerificationCode":
+			code, err := totp.GenerateCode(totpSecret, time.Now())
+			if err != nil {
+				return nil, fmt.Errorf("generate TOTP: %w", err)
+			}
+			data.Set(field, code)
+		case "reset_totp":
+			data.Set(field, "false")
+		case "totp_skip_days":
+			data.Set(field, "true")
+		case "rememberMePeriodChangeInfo", "exactAssistantPayload":
+			// Informational/optional fields; present in SA_FIELDS but not required for submission.
+		default:
+			unknown = append(unknown, field)
+		}
+	}
+
+	if len(unknown) > 0 {
+		return nil, fmt.Errorf("unhandled B2C fields: %v", unknown)
+	}
+	return data, nil
 }
 
 func containsField(fields []string, name string) bool {
